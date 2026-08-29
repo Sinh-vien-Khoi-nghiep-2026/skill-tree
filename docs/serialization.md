@@ -7,11 +7,12 @@ ObjectTree does not use `pickle`, import a type named by stored data, or execute
 Supported built-in values are:
 
 - `None`, strings, booleans, integers, and finite floats;
-- lists and tuples;
-- mappings with string keys;
+- plain built-in lists, tuples, and dictionaries with plain string keys;
 - instances whose **exact type** is registered.
 
-Non-finite floats, cycles, non-string mapping keys, malformed envelopes, unsupported versions, and unregistered object types fail closed with `SerializationError` subclasses.
+Subclasses such as `IntEnum`, named tuples, and custom dictionary/list classes are not silently reduced to their base value. Register them explicitly when their identity matters.
+
+Non-finite floats, cycles, non-string dictionary keys, malformed envelopes, unsupported versions, and unregistered object types fail closed with `SerializationError` subclasses. Canonical comparisons preserve JSON scalar types, so `True`, `1`, and `1.0` are three distinct stored values and history changes.
 
 ## Registry
 
@@ -58,7 +59,7 @@ The encoded object envelope is conceptually:
 }
 ```
 
-Mappings and tuples are tagged too, preventing a user mapping from being confused with an object envelope. Mapping entries are sorted to produce deterministic commit hashes.
+Dictionaries and tuples are tagged too, preventing a user dictionary from being confused with an object envelope. Dictionary entries are sorted to produce deterministic commit hashes. Semantic diff keeps envelope type/version identity separate from user payload keys such as `$type`.
 
 ## Versions and migrations
 

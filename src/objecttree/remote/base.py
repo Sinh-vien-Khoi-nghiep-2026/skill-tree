@@ -10,9 +10,21 @@ from ..exceptions import (
     RemoteError,
     RevisionNotFoundError,
 )
-from ..history import ancestry, compute_commit_id, is_ancestor, reconstruct_state
+from ..history import (
+    ancestry,
+    compute_commit_id,
+    is_ancestor,
+    reconstruct_state,
+    validate_node_id_uniqueness,
+)
 from ..models import Commit, PushResult, RemotePack
-from ..state import TreeState, clone_commit, commit_from_data, commit_to_data
+from ..state import (
+    TreeState,
+    clone_commit,
+    commit_from_data,
+    commit_to_data,
+    commits_equal,
+)
 
 REMOTE_SCHEMA_VERSION = 1
 
@@ -21,6 +33,7 @@ REMOTE_SCHEMA_VERSION = 1
 class RemoteStore(Protocol):
     """Synchronous remote interface.
 
+    Packs contain the complete one-parent ancestry of their advertised head.
     A future async implementation can expose the same immutable RemotePack wire
     values through a separate adapter without changing ObjectTree's core API.
     """
@@ -30,15 +43,50 @@ class RemoteStore(Protocol):
     def push(self, pack: RemotePack) -> PushResult: ...
 
 
+def validate_remote_pack(pack: RemotePack) -> RemotePack:
+    """Deeply detach and validate one complete, single-head history pack."""
+    if not isinstance(pack, RemotePack):
+        raise RemoteError("remote payload is not a RemotePack")
+    if pack.head is not None and not isinstance(pack.head, str):
+        raise RemoteError("remote head must be a string or null")
+
+    commits: dict[str, Commit] = {}
+    ordered: list[Commit] = []
+    try:
+        for untrusted in pack.commits:
+            commit = clone_commit(untrusted)
+            if commit.id in commits:
+                raise RemoteError(f"remote pack repeats commit {commit.id!r}")
+            if compute_commit_id(commit) != commit.id:
+                raise RemoteError(f"remote pack has invalid hash {commit.id!r}")
+            commits[commit.id] = commit
+            ordered.append(commit)
+    except CorruptStoreError as exc:
+        raise RemoteError("remote pack contains malformed commit data") from exc
+
+    for commit in commits.values():
+        if commit.parent is not None and commit.parent not in commits:
+            raise RemoteError(f"remote pack commit {commit.id!r} has a missing parent")
+    if pack.head is not None and pack.head not in commits:
+        raise RemoteError("remote pack head is absent from the pack")
+    if set(commits) != set(ancestry(pack.head, commits)):
+        raise RemoteError("remote pack contains history outside its head ancestry")
+    try:
+        validate_node_id_uniqueness(commits)
+        cache: dict[str | None, TreeState] = {None: reconstruct_state(None, commits)}
+        for commit_id in commits:
+            reconstruct_state(commit_id, commits, cache)
+    except (CorruptStoreError, KeyError, RevisionNotFoundError) as exc:
+        raise RemoteError("remote pack history is not replayable") from exc
+    return RemotePack(tuple(ordered), pack.head)
+
+
 def accept_push(
     existing: dict[str, Commit],
     current_head: str | None,
     pack: RemotePack,
 ) -> tuple[dict[str, Commit], PushResult]:
-    if not isinstance(pack, RemotePack):
-        raise RemoteError("push payload is not a RemotePack")
-    if pack.head is not None and not isinstance(pack.head, str):
-        raise RemoteError("proposed remote head must be a string or null")
+    pack = validate_remote_pack(pack)
     combined = {commit_id: clone_commit(commit) for commit_id, commit in existing.items()}
     received: list[str] = []
     supplied: set[str] = set()
@@ -51,7 +99,7 @@ def accept_push(
             if compute_commit_id(commit) != commit.id:
                 raise RemoteError(f"push contains invalid commit hash {commit.id!r}")
             previous = combined.get(commit.id)
-            if previous is not None and previous != commit:
+            if previous is not None and not commits_equal(previous, commit):
                 raise RemoteError(f"push redefines commit {commit.id!r}")
             if previous is None:
                 combined[commit.id] = commit
@@ -112,6 +160,7 @@ def remote_pack_from_payload(payload: object) -> RemotePack:
     if set(commits) != set(ancestry(head, commits)):
         raise CorruptStoreError("remote contains commits outside its HEAD history")
     try:
+        validate_node_id_uniqueness(commits)
         cache: dict[str | None, TreeState] = {None: reconstruct_state(None, commits)}
         for commit_id in commits:
             reconstruct_state(commit_id, commits, cache)

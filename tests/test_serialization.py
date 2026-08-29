@@ -12,6 +12,7 @@ from objecttree import (
     UnknownTypeError,
     UnsupportedVersionError,
 )
+from objecttree.remote import MemoryRemote
 from objecttree.store import MemoryStore
 
 from .conftest import Skill, skill_registry
@@ -20,6 +21,15 @@ from .conftest import Skill, skill_registry
 @dataclass(frozen=True)
 class Token:
     text: str
+
+
+@dataclass(frozen=True)
+class OtherToken:
+    text: str
+
+
+class Count(int):
+    pass
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,22 @@ def test_custom_serializer_and_nested_safe_values_round_trip() -> None:
     assert serializer.load(serializer.dump(value)) == value
 
 
+def test_builtin_subclasses_require_registration_instead_of_type_erasure() -> None:
+    registry = SerializerRegistry()
+    with pytest.raises(UnknownTypeError):
+        registry.encode(Count(3))
+
+    registry.register(
+        Count,
+        lambda value: str(value),
+        lambda data: Count(int(data)),
+        type_id="tests.Count",
+    )
+    round_trip = registry.decode(registry.encode(Count(3)))
+    assert type(round_trip) is Count
+    assert round_trip == 3
+
+
 def test_unregistered_types_and_unsafe_primitives_are_rejected() -> None:
     registry = SerializerRegistry()
     with pytest.raises(UnknownTypeError):
@@ -69,6 +95,49 @@ def test_unregistered_types_and_unsafe_primitives_are_rejected() -> None:
         registry.encode(float("nan"))
     with pytest.raises(SerializationError):
         registry.decode({"unexpected": "raw mapping"})
+
+
+def test_semantic_diff_reserves_object_identity_outside_payload_keys() -> None:
+    tree = ObjectTree()
+    tree.register(
+        Token,
+        lambda value: {"$type": value.text, "$version": 1},
+        lambda data: Token(data["$type"]),
+        type_id="tests.Token",
+    )
+    tree.register(
+        OtherToken,
+        lambda value: {"$type": value.text, "$version": 1},
+        lambda data: OtherToken(data["$type"]),
+        type_id="tests.OtherToken",
+    )
+    tree.add("token", Token("same"))
+    tree.commit("Token")
+    tree.set("token", OtherToken("same"))
+    tree.commit("Other token")
+
+    fields = {delta.field for delta in tree.diff("HEAD~1", "HEAD").updated[0].deltas}
+    assert "$object.type" in fields
+
+
+def test_nested_registered_objects_are_safe_in_semantic_diff_and_remote_replay() -> None:
+    remote = MemoryRemote()
+    tree = ObjectTree(remote=remote)
+    tree.register(
+        Token,
+        lambda value: {"text": value.text},
+        lambda data: Token(data["text"]),
+        type_id="tests.Token",
+    )
+    tree.add("nested", {"items": [Token("before")]})
+    tree.commit("Before")
+    tree.set("nested", {"items": [Token("after")]})
+    tree.commit("After")
+
+    change = tree.diff("HEAD~1", "HEAD").updated[0]
+    assert change.deltas[0].field == "items"
+    assert change.deltas[0].before != change.deltas[0].after
+    tree.push()  # Remote replay must not need Token's registered loader.
 
 
 def test_unknown_type_can_be_loaded_structurally_then_registered() -> None:

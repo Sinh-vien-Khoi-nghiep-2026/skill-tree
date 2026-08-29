@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from objecttree import ChangeKind, NothingToCommitError, ObjectTree, RevisionNotFoundError
 
-from .conftest import Skill
+from .conftest import Skill, skill_registry
 
 
 def test_working_state_is_separate_from_head_and_commit_log(tree: ObjectTree) -> None:
@@ -50,6 +52,38 @@ def test_semantic_diff_and_revision_expressions(tree: ObjectTree) -> None:
     assert tree.show(second).message == "August assessment"
     with pytest.raises(RevisionNotFoundError):
         tree.show("HEAD~2")
+
+
+def test_history_preserves_bool_int_and_float_type_changes(tree: ObjectTree) -> None:
+    with tree.transaction("Integer"):
+        tree.add("value", 1)
+    with tree.transaction("Boolean"):
+        tree.set("value", True)
+
+    delta = tree.diff("HEAD~1", "HEAD").updated[0].deltas[0]
+    assert type(delta.before) is int
+    assert type(delta.after) is bool
+    assert tree.show().message == "Boolean"
+
+
+def test_updated_at_remains_replayable_when_the_wall_clock_moves_back(
+    tree: ObjectTree,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    future = datetime(2035, 1, 1, tzinfo=UTC)
+    past = datetime(2025, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr("objecttree.tree.utc_now", lambda: future)
+    tree.add("value", 1)
+    tree.commit("Future timestamp")
+
+    monkeypatch.setattr("objecttree.tree.utc_now", lambda: past)
+    tree.set("value", 2)
+    tree.commit("Clock moved back")
+
+    assert tree.node("value").updated_at == future
+    reopened = ObjectTree(tree.store, registry=skill_registry())
+    assert reopened.get("value") == 2
+    assert reopened.show().message == "Clock moved back"
 
 
 def test_path_log_tracks_stable_identity_across_ancestor_rename(tree: ObjectTree) -> None:

@@ -82,7 +82,7 @@ An exception in a handler propagates to its caller, but durability has already h
 
 ## Fetch
 
-`fetch()` obtains the remote pack, deeply detaches and validates every commit, imports unknown commits, updates `REMOTE_HEAD`, and persists tracking state.
+`fetch()` obtains the remote pack, deeply detaches and validates every commit, imports unknown commits, updates `REMOTE_HEAD`, and persists tracking state. The v0.1 `RemotePack` contract carries the complete single-parent ancestry of its advertised head (not a thin/incremental pack); transports can optimize this in a future compatible protocol version.
 
 ```text
 Working Tree   unchanged

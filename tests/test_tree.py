@@ -25,6 +25,18 @@ def test_add_get_set_and_path_convenience(tree: ObjectTree) -> None:
     assert tree.get(added.path) == Skill("Python", 0.8)
 
 
+def test_encoded_scalar_types_are_not_conflated(tree: ObjectTree) -> None:
+    tree.add("value", 1, metadata={"score": 1})
+    tree.set("value", True)
+    tree.update_metadata("value", {"score": True})
+    assert tree.get("value") is True
+    assert tree.node("value").metadata["score"] is True
+
+    tree.set("value", 1.0)
+    assert tree.get("value") == 1.0
+    assert type(tree.get("value")) is float
+
+
 def test_add_validates_duplicates_paths_and_missing_parents(tree: ObjectTree) -> None:
     tree.add("a/b", 1)
     with pytest.raises(NodeAlreadyExistsError):

@@ -6,6 +6,7 @@ import pytest
 
 from objecttree import ConcurrentWriteError, CorruptStoreError, ObjectTree
 from objecttree.remote import FileRemote
+from objecttree.store import MemoryStore
 
 from .conftest import Skill, skill_registry
 
@@ -65,6 +66,20 @@ def test_stale_file_store_writer_is_rejected_without_corrupting_winner(tmp_path)
     assert reopened.get("winner") == 1
     assert not reopened.exists("loser")
     assert not stale.exists("loser")
+
+
+def test_noncanonical_synthetic_root_is_rejected() -> None:
+    store = MemoryStore()
+    tree = ObjectTree(store)
+    tree.add("value", 1)
+    document = store.load()
+    assert document.payload is not None
+    root = next(node for node in document.payload["working"] if node["parent_id"] is None)
+    root["value"] = True
+    store.save(document.payload, expected_generation=document.generation)
+
+    with pytest.raises(CorruptStoreError, match="root"):
+        ObjectTree(store)
 
 
 def test_malformed_repository_document_is_reported(tmp_path) -> None:

@@ -79,6 +79,20 @@ def test_transaction_rolls_back_when_atomic_store_save_fails() -> None:
     assert store.load().payload is None
 
 
+def test_commit_save_failure_restores_history_but_keeps_dirty_working_tree() -> None:
+    store = FailingMemoryStore()
+    tree = ObjectTree(store)
+    tree.add("assessment", 1)
+    store.fail_next = True
+
+    with pytest.raises(StoreError, match="injected"):
+        tree.commit("Should fail")
+    assert tree.head is None
+    assert tree.log() == []
+    assert tree.get("assessment") == 1
+    assert tree.diff().added
+
+
 def test_failed_non_transactional_mutation_restores_working_state() -> None:
     store = FailingMemoryStore()
     tree = ObjectTree(store)

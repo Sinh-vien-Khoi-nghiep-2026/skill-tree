@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from .exceptions import CorruptStoreError, NodeNotFoundError
 from .models import Change, ChangeKind, Commit, FieldDelta, StoredNode
@@ -52,8 +53,8 @@ class TreeState:
         root = self.nodes.get(ROOT_NODE_ID)
         if root is None:
             raise CorruptStoreError("tree state has no root node")
-        if root.parent_id is not None or root.name != "":
-            raise CorruptStoreError("invalid root node")
+        if root != root_node():
+            raise CorruptStoreError("the synthetic root record is not canonical")
 
         children: dict[str, dict[str, str]] = {node_id: {} for node_id in self.nodes}
         for node_id, node in self.nodes.items():
@@ -61,6 +62,11 @@ class TreeState:
                 raise CorruptStoreError(f"node key/id mismatch for {node_id!r}")
             if node_id == ROOT_NODE_ID:
                 continue
+            try:
+                if str(UUID(node_id)) != node_id:
+                    raise ValueError
+            except (AttributeError, ValueError) as exc:
+                raise CorruptStoreError(f"invalid canonical node UUID: {node_id!r}") from exc
             if not node.name or "/" in node.name or "\x00" in node.name or node.name in {".", ".."}:
                 raise CorruptStoreError(f"invalid persisted node name: {node.name!r}")
             parent_id = node.parent_id
@@ -77,6 +83,8 @@ class TreeState:
                 raise CorruptStoreError(f"invalid tags for node {node_id!r}")
             if node.created_at.tzinfo is None or node.updated_at.tzinfo is None:
                 raise CorruptStoreError(f"timestamps must be timezone-aware for node {node_id!r}")
+            if node.updated_at < node.created_at:
+                raise CorruptStoreError(f"updated_at precedes created_at for node {node_id!r}")
 
         # Every parent chain must terminate at the fixed root.
         for node_id in self.nodes:
@@ -196,6 +204,31 @@ def stored_node_to_data(node: StoredNode) -> dict[str, Any]:
     }
 
 
+def canonical_json(data: object) -> str:
+    """Return deterministic JSON that preserves JSON scalar types."""
+    try:
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise CorruptStoreError("value is not canonical JSON data") from exc
+
+
+def encoded_equal(left: object, right: object) -> bool:
+    """Compare encoded data without Python's ``True == 1 == 1.0`` coercion."""
+    return canonical_json(left) == canonical_json(right)
+
+
+def stored_nodes_equal(left: StoredNode | None, right: StoredNode | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return canonical_json(stored_node_to_data(left)) == canonical_json(stored_node_to_data(right))
+
+
 def stored_node_from_data(data: object) -> StoredNode:
     if not isinstance(data, dict):
         raise CorruptStoreError("node record must be an object")
@@ -300,6 +333,12 @@ def change_from_data(data: object) -> Change:
     )
 
 
+def changes_equal(left: tuple[Change, ...], right: tuple[Change, ...]) -> bool:
+    return canonical_json([change_to_data(item) for item in left]) == canonical_json(
+        [change_to_data(item) for item in right]
+    )
+
+
 def commit_to_data(commit: Commit, *, include_id: bool = True) -> dict[str, Any]:
     data: dict[str, Any] = {
         "parent": commit.parent,
@@ -313,20 +352,16 @@ def commit_to_data(commit: Commit, *, include_id: bool = True) -> dict[str, Any]
     return data
 
 
+def commits_equal(left: Commit, right: Commit) -> bool:
+    return canonical_json(commit_to_data(left)) == canonical_json(commit_to_data(right))
+
+
 def clone_commit(commit: Commit) -> Commit:
     """Return a canonical, deeply detached copy of a commit."""
     if not isinstance(commit, Commit):
         raise CorruptStoreError("expected a Commit instance")
     try:
-        payload = json.loads(
-            json.dumps(
-                commit_to_data(commit),
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )
+        payload = json.loads(canonical_json(commit_to_data(commit)))
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise CorruptStoreError("commit contains malformed or non-JSON data") from exc
     return commit_from_data(payload)

@@ -7,7 +7,7 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass as dataclass_decorator
 from dataclasses import fields, is_dataclass
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeVar, cast, runtime_checkable
 
 from .exceptions import SerializationError, UnknownTypeError, UnsupportedVersionError
 
@@ -16,6 +16,15 @@ DumpFunction = Callable[[Any], object]
 LoadFunction = Callable[[object], Any]
 Migration = Callable[[object], object]
 _TAG = "$objecttree"
+
+
+@dataclass_decorator(frozen=True, slots=True)
+class SemanticObject:
+    """Callback-free object envelope used internally for semantic diffs."""
+
+    type_id: object
+    version: object
+    data: object
 
 
 @runtime_checkable
@@ -133,52 +142,61 @@ class SerializerRegistry:
             raise SerializationError("value nesting is too deep") from exc
 
     def _encode(self, obj: object, active: set[int]) -> object:
-        if obj is None or isinstance(obj, (str, bool, int)):
-            return obj
-        if isinstance(obj, float):
-            if not math.isfinite(obj):
-                raise SerializationError("non-finite floats are not supported")
-            return obj
+        obj_type = type(obj)
+        registration = self._by_class.get(obj_type)
+        if registration is None:
+            if obj is None or obj_type in {str, bool, int}:
+                return obj
+            if obj_type is float:
+                number = cast(float, obj)
+                if not math.isfinite(number):
+                    raise SerializationError("non-finite floats are not supported")
+                return number
+            if obj_type not in {list, tuple, dict}:
+                raise UnknownTypeError(
+                    f"type {obj_type.__module__}.{obj_type.__qualname__} is not registered"
+                )
 
-        registration = self._by_class.get(type(obj))
-        is_container = isinstance(obj, (list, tuple, Mapping))
-        if not is_container and registration is None:
-            cls = type(obj)
-            raise UnknownTypeError(f"type {cls.__module__}.{cls.__qualname__} is not registered")
         identity = id(obj)
         if identity in active:
             raise SerializationError("cyclic values are not supported")
         active.add(identity)
         try:
-            if isinstance(obj, list):
-                return [self._encode(item, active) for item in obj]
-            if isinstance(obj, tuple):
+            if registration is not None:
+                try:
+                    raw_data = registration.dump(obj)
+                except SerializationError:
+                    raise
+                except Exception as exc:  # trusted callback boundary
+                    raise SerializationError(
+                        f"serializer for {registration.type_id!r} failed while dumping"
+                    ) from exc
+                return {
+                    _TAG: "object",
+                    "type": registration.type_id,
+                    "version": registration.version,
+                    "data": self._encode(raw_data, active),
+                }
+            if obj_type is list:
+                sequence = cast(list[object], obj)
+                return [self._encode(item, active) for item in sequence]
+            if obj_type is tuple:
+                sequence = cast(tuple[object, ...], obj)
                 return {
                     _TAG: "tuple",
-                    "items": [self._encode(item, active) for item in obj],
-                }
-            if isinstance(obj, Mapping):
-                if not all(isinstance(key, str) for key in obj):
-                    raise SerializationError("mapping keys must be strings")
-                return {
-                    _TAG: "mapping",
-                    "items": [[key, self._encode(obj[key], active)] for key in sorted(obj)],
+                    "items": [self._encode(item, active) for item in sequence],
                 }
 
-            assert registration is not None
-            try:
-                raw_data = registration.dump(obj)
-            except SerializationError:
-                raise
-            except Exception as exc:  # trusted callback boundary
-                raise SerializationError(
-                    f"serializer for {registration.type_id!r} failed while dumping"
-                ) from exc
+            mapping = cast(dict[object, object], obj)
+            if not all(type(key) is str for key in mapping):
+                raise SerializationError("mapping keys must be plain strings")
+            string_mapping = cast(dict[str, object], mapping)
             return {
-                _TAG: "object",
-                "type": registration.type_id,
-                "version": registration.version,
-                "data": self._encode(raw_data, active),
+                _TAG: "mapping",
+                "items": [
+                    [key, self._encode(string_mapping[key], active)]
+                    for key in sorted(string_mapping)
+                ],
             }
         finally:
             active.remove(identity)
@@ -191,13 +209,15 @@ class SerializerRegistry:
             raise SerializationError("encoded value nesting is too deep") from exc
 
     def _decode(self, encoded: object, active: set[int]) -> object:
-        if encoded is None or isinstance(encoded, (str, bool, int)):
+        encoded_type = type(encoded)
+        if encoded is None or encoded_type in {str, bool, int}:
             return encoded
-        if isinstance(encoded, float):
-            if not math.isfinite(encoded):
+        if encoded_type is float:
+            number = cast(float, encoded)
+            if not math.isfinite(number):
                 raise SerializationError("encoded non-finite float")
-            return encoded
-        if not isinstance(encoded, (list, dict)):
+            return number
+        if encoded_type not in {list, dict}:
             raise SerializationError(f"invalid encoded value: {type(encoded).__name__}")
 
         identity = id(encoded)
@@ -205,18 +225,20 @@ class SerializerRegistry:
             raise SerializationError("cyclic encoded data is not supported")
         active.add(identity)
         try:
-            if isinstance(encoded, list):
-                return [self._decode(item, active) for item in encoded]
+            if encoded_type is list:
+                sequence = cast(list[object], encoded)
+                return [self._decode(item, active) for item in sequence]
 
-            tag = encoded.get(_TAG)
+            envelope = cast(dict[str, object], encoded)
+            tag = envelope.get(_TAG)
             if tag == "tuple":
-                items = encoded.get("items")
-                if set(encoded) != {_TAG, "items"} or not isinstance(items, list):
+                items = envelope.get("items")
+                if set(envelope) != {_TAG, "items"} or not isinstance(items, list):
                     raise SerializationError("malformed tuple envelope")
                 return tuple(self._decode(item, active) for item in items)
             if tag == "mapping":
-                items = encoded.get("items")
-                if set(encoded) != {_TAG, "items"} or not isinstance(items, list):
+                items = envelope.get("items")
+                if set(envelope) != {_TAG, "items"} or not isinstance(items, list):
                     raise SerializationError("malformed mapping envelope")
                 result: dict[str, object] = {}
                 for pair in items:
@@ -231,11 +253,11 @@ class SerializerRegistry:
                 return result
             if tag != "object":
                 raise SerializationError("unknown serialization envelope")
-            if set(encoded) != {_TAG, "type", "version", "data"}:
+            if set(envelope) != {_TAG, "type", "version", "data"}:
                 raise SerializationError("malformed object envelope")
 
-            type_id = encoded.get("type")
-            version = encoded.get("version")
+            type_id = envelope.get("type")
+            version = envelope.get("version")
             if not isinstance(type_id, str):
                 raise SerializationError("object type identifier must be a string")
             if not isinstance(version, int) or isinstance(version, bool) or version < 1:
@@ -249,7 +271,7 @@ class SerializerRegistry:
                     f"{registration.version}"
                 )
 
-            data = self._decode(encoded["data"], active)
+            data = self._decode(envelope["data"], active)
             current = version
             while current < registration.version:
                 migration = registration.migrations.get(current)
@@ -303,18 +325,11 @@ class SerializerRegistry:
                 if isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str)
             }
         if tag == "object":
-            data = self.semantic_data(encoded.get("data"))
-            if isinstance(data, dict):
-                return {
-                    "$type": encoded.get("type"),
-                    "$version": encoded.get("version"),
-                    **data,
-                }
-            return {
-                "$type": encoded.get("type"),
-                "$version": encoded.get("version"),
-                "value": data,
-            }
+            return SemanticObject(
+                encoded.get("type"),
+                encoded.get("version"),
+                self.semantic_data(encoded.get("data")),
+            )
         return repr(encoded)
 
 

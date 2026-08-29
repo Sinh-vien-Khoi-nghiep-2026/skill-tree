@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any, TypeVar
@@ -21,11 +22,13 @@ from .exceptions import (
     RemoteNotConfiguredError,
     RevisionNotFoundError,
     SerializationError,
+    StoreError,
     TransactionError,
 )
 from .history import (
     ancestry,
     ancestry_oldest_first,
+    apply_commit,
     diff_states,
     is_ancestor,
     make_commit,
@@ -35,6 +38,7 @@ from .history import (
     scope_ids_for_path,
     state_for_revision,
     validate_history,
+    validate_node_id_uniqueness,
 )
 from .models import (
     Commit,
@@ -49,13 +53,15 @@ from .models import (
     TreeSnapshot,
 )
 from .paths import ROOT_PATH, child_path, normalize_path, parent_and_name, split_path, validate_name
-from .remote.base import RemoteStore
+from .remote.base import RemoteStore, validate_remote_pack
 from .serialization import Migration, SerializerRegistry
 from .state import (
     ROOT_NODE_ID,
     RepositoryData,
     TreeState,
     clone_commit,
+    commits_equal,
+    encoded_equal,
     repository_from_payload,
     repository_to_payload,
     utc_now,
@@ -353,10 +359,14 @@ class ObjectTree:
             state = self._repository.working
             node_id = state.resolve(canonical)
             old = state.nodes[node_id]
-            if old.value == encoded:
+            if encoded_equal(old.value, encoded):
                 return self._view(state, node_id)
             nodes = dict(state.nodes)
-            nodes[node_id] = replace(old, value=encoded, updated_at=utc_now())
+            nodes[node_id] = replace(
+                old,
+                value=encoded,
+                updated_at=self._next_updated_at(old),
+            )
             new_state = TreeState(nodes)
             result = self._view(new_state, node_id)
             events_to_emit = self._install_working(
@@ -390,10 +400,14 @@ class ObjectTree:
                     raise SerializationError("persisted node metadata is not a mapping")
                 metadata = {**decoded, **dict(updates)}
             encoded = self.registry.encode(metadata)
-            if encoded == old.metadata:
+            if encoded_equal(encoded, old.metadata):
                 return self._view(state, node_id)
             nodes = dict(state.nodes)
-            nodes[node_id] = replace_dataclass(old, metadata=encoded, updated_at=utc_now())
+            nodes[node_id] = replace_dataclass(
+                old,
+                metadata=encoded,
+                updated_at=self._next_updated_at(old),
+            )
             new_state = TreeState(nodes)
             result = self._view(new_state, node_id)
             events_to_emit = self._install_working(
@@ -415,7 +429,11 @@ class ObjectTree:
             if old.tags == normalized:
                 return self._view(state, node_id)
             nodes = dict(state.nodes)
-            nodes[node_id] = replace(old, tags=normalized, updated_at=utc_now())
+            nodes[node_id] = replace(
+                old,
+                tags=normalized,
+                updated_at=self._next_updated_at(old),
+            )
             new_state = TreeState(nodes)
             result = self._view(new_state, node_id)
             events_to_emit = self._install_working(
@@ -471,7 +489,7 @@ class ObjectTree:
                 old,
                 parent_id=target_parent_id,
                 name=target_name,
-                updated_at=utc_now(),
+                updated_at=self._next_updated_at(old),
             )
             new_state = TreeState(nodes)
             result = self._view(new_state, source_id)
@@ -838,6 +856,10 @@ class ObjectTree:
             author=self.author if author is None else author,
             changes=changes,
         )
+        # Never persist a locally generated commit that cannot be replayed or
+        # reuses an identity from an earlier node lifetime.
+        apply_commit(parent_state, commit)
+        validate_node_id_uniqueness({**self._repository.commits, commit.id: commit})
         self._repository.commits[commit.id] = commit
         self._repository.head = commit.id
         return commit
@@ -855,9 +877,7 @@ class ObjectTree:
 
     def _fetch_locked(self) -> FetchResult:
         assert self.remote is not None
-        pack = self.remote.fetch()
-        if not isinstance(pack, RemotePack):
-            raise RemoteError("remote.fetch() returned an invalid pack")
+        pack = validate_remote_pack(self.remote.fetch())
         previous_commits = dict(self._repository.commits)
         previous_remote_head = self._repository.remote_head
         received: list[str] = []
@@ -865,7 +885,7 @@ class ObjectTree:
             for untrusted in pack.commits:
                 commit = clone_commit(untrusted)
                 existing = self._repository.commits.get(commit.id)
-                if existing is not None and existing != commit:
+                if existing is not None and not commits_equal(existing, commit):
                     raise RemoteError(f"remote redefined commit {commit.id!r}")
                 if existing is None:
                     self._repository.commits[commit.id] = commit
@@ -874,7 +894,7 @@ class ObjectTree:
             validate_history(self._repository)
             if received or previous_remote_head != pack.head:
                 self._persist()
-        except RemoteError:
+        except (RemoteError, StoreError):
             self._repository.commits = previous_commits
             self._repository.remote_head = previous_remote_head
             raise
@@ -939,6 +959,10 @@ class ObjectTree:
             raise TransactionError("remote operations are not allowed from event handlers")
         if self.remote is None:
             raise RemoteNotConfiguredError("no remote is configured")
+
+    @staticmethod
+    def _next_updated_at(record: StoredNode) -> datetime:
+        return max(utc_now(), record.updated_at)
 
     @staticmethod
     def _normalize_tags(tags: Iterable[str]) -> tuple[str, ...]:
